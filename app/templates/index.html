@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NEET Counselling Assistant</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <main class="max-w-5xl mx-auto px-4 py-8">
+    <section class="bg-white border border-slate-200 rounded-2xl shadow-sm p-6">
+      <h1 class="text-2xl font-bold">AI NEET Counselling Assistant</h1>
+      <p class="text-slate-600 mt-1">Ask questions in plain English and get ranked college insights.</p>
+
+      <div class="mt-4 flex gap-2">
+        <input
+          id="question"
+          type="text"
+          placeholder="e.g. Best colleges in Karnataka under rank 5000"
+          class="flex-1 border border-slate-300 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+        />
+        <button
+          id="askBtn"
+          class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium px-5 py-3 rounded-xl transition"
+        >
+          Ask
+        </button>
+      </div>
+
+      <div id="suggestions" class="mt-4 flex flex-wrap gap-2"></div>
+    </section>
+
+    <section id="loading" class="hidden mt-6 bg-white border border-slate-200 rounded-2xl p-5">
+      <div class="flex items-center gap-3">
+        <div class="h-5 w-5 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
+        <p class="text-slate-700">Thinking and fetching cutoff data...</p>
+      </div>
+    </section>
+
+    <section id="result" class="hidden mt-6 space-y-4">
+      <div class="bg-white border border-slate-200 rounded-2xl p-5">
+        <p class="text-xs uppercase text-slate-500 tracking-wide">Your query</p>
+        <p id="userQuery" class="mt-1 font-medium"></p>
+      </div>
+
+      <div class="bg-white border border-slate-200 rounded-2xl p-5">
+        <p class="text-xs uppercase text-slate-500 tracking-wide">Counsellor response</p>
+        <p id="answerText" class="mt-2 whitespace-pre-line leading-7 text-slate-800"></p>
+      </div>
+
+      <div class="bg-white border border-slate-200 rounded-2xl p-5">
+        <div class="flex items-center justify-between">
+          <p class="text-xs uppercase text-slate-500 tracking-wide">Generated SQL</p>
+          <div class="flex gap-2">
+            <button id="toggleSqlBtn" class="text-sm px-3 py-1 rounded-lg border border-slate-300 hover:bg-slate-100">Toggle</button>
+            <button id="copySqlBtn" class="text-sm px-3 py-1 rounded-lg border border-slate-300 hover:bg-slate-100">Copy SQL</button>
+          </div>
+        </div>
+        <pre id="sqlBlock" class="mt-3 p-3 text-xs bg-slate-900 text-emerald-300 rounded-lg overflow-x-auto hidden"></pre>
+      </div>
+
+      <div class="bg-white border border-slate-200 rounded-2xl p-5">
+        <p class="text-xs uppercase text-slate-500 tracking-wide mb-3">Results</p>
+        <div class="overflow-x-auto">
+          <table class="min-w-full text-sm">
+            <thead>
+              <tr class="text-left border-b border-slate-200">
+                <th class="py-2 pr-4">College</th>
+                <th class="py-2 pr-4">State</th>
+                <th class="py-2 pr-4">Category</th>
+                <th class="py-2 pr-4">AIR Rank</th>
+                <th class="py-2 pr-4">Score</th>
+                <th class="py-2 pr-4">Fee</th>
+                <th class="py-2 pr-4">Course</th>
+                <th class="py-2 pr-4">Round</th>
+              </tr>
+            </thead>
+            <tbody id="tableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="errorBox" class="hidden mt-6 bg-rose-50 text-rose-700 border border-rose-200 rounded-2xl p-4"></section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
