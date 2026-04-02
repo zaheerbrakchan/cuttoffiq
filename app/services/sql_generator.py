@@ -5,7 +5,17 @@ import re
 
 from openai import OpenAI
 
-SQL_SYSTEM_PROMPT = """
+from app.services.query_normalization import (
+    CANONICAL_COURSES,
+    CANONICAL_STATES,
+    fix_sql_state_and_course,
+    normalize_user_question,
+)
+
+_STATE_LIST = ", ".join(sorted(CANONICAL_STATES))
+_COURSE_LIST = ", ".join(sorted(CANONICAL_COURSES))
+
+SQL_SYSTEM_PROMPT = f"""
 You are an expert PostgreSQL query generator for a NEET counselling assistant.
 
 Hard rules:
@@ -18,6 +28,10 @@ Hard rules:
 7) Use case-insensitive filtering with ILIKE where useful.
 8) For rank conditions, use air_rank unless user explicitly says state rank.
 9) Sort by better rank first (air_rank ASC) where ranking is relevant.
+10) State names in the database are EXACTLY one of: {_STATE_LIST}
+    Use these exact spellings in state filters (Jammu & Kashmir is stored as J&K; Tamil Nadu as TAMILNADU).
+11) Course names in the database are EXACTLY one of: {_COURSE_LIST}
+    Use these exact spellings in course filters (e.g. BDS not bds when matching stored values; ILIKE is fine).
 """
 logger = logging.getLogger("neet_assistant.sql")
 
@@ -60,18 +74,21 @@ def _ensure_limit(sql: str, limit: int = 50) -> str:
 
 
 def generate_sql(client: OpenAI, user_question: str) -> str:
+    normalized = normalize_user_question(user_question)
     logger.info("Generating SQL for question length=%d", len(user_question))
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": SQL_SYSTEM_PROMPT.strip()},
-            {"role": "user", "content": user_question.strip()},
+            {"role": "user", "content": normalized.strip()},
         ],
         temperature=0,
     )
 
     raw_sql = response.choices[0].message.content or ""
     sql = _ensure_limit(_clean_sql(raw_sql), limit=50)
+    sql = fix_sql_state_and_course(sql)
+    logger.info("SQL after state/course normalization: %s", sql)
 
     if not _is_safe_select(sql):
         logger.warning("SQL blocked by safety checks: %s", sql)
@@ -109,18 +126,3 @@ Your job:
         temperature=0.3,
     )
     return (response.choices[0].message.content or "").strip()
-
-
-def generate_suggestions(client: OpenAI) -> list[str]:
-    prompt = """
-Generate 5 short natural-language sample queries a NEET aspirant might ask.
-Return one per line only, no numbering.
-"""
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt.strip()}],
-        temperature=0.7,
-    )
-    text = (response.choices[0].message.content or "").strip()
-    suggestions = [line.strip("- ").strip() for line in text.splitlines() if line.strip()]
-    return suggestions[:5]

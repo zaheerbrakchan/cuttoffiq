@@ -17,11 +17,15 @@ from app.services.sql_generator import (
     generate_counsellor_answer,
     generate_sql,
 )
-from app.services.supabase_service import (
-    execute_neet_query,
-    get_suggestion_context,
-    get_supabase_client,
-)
+from app.services.supabase_service import execute_neet_query, get_supabase_client
+
+# Fixed chips shown in the UI (see GET /suggestions).
+DEFAULT_SUGGESTIONS: list[str] = [
+    "Top MBBS colleges in MCC under rank 5000",
+    "my rank is 4356 which colleges i can get in Karnataka",
+    "Top Colleges in Andra for the neet score above 580",
+    "Best BDS colleges in jammu and kashmir under 20000 AIR rank",
+]
 
 load_dotenv()
 logging.basicConfig(
@@ -97,47 +101,4 @@ def ask_form(question: str = Form(...)):
 
 @app.get("/suggestions")
 def suggestions():
-    try:
-        supabase_client = get_supabase_client()
-        context = get_suggestion_context(supabase_client)
-        logger.info(
-            "Suggestion context loaded: states=%d categories=%d courses=%d rounds=%d",
-            len(context.get("states", [])),
-            len(context.get("categories", [])),
-            len(context.get("courses", [])),
-            len(context.get("rounds", [])),
-        )
-
-        states = context.get("states", [])
-        categories = context.get("categories", [])
-        courses = context.get("courses", [])
-        rounds = context.get("rounds", [])
-
-        state_1 = states[0] if states else "KARNATAKA"
-        state_2 = states[1] if len(states) > 1 else state_1
-        category_1 = categories[0] if categories else "GENERAL"
-        category_2 = categories[1] if len(categories) > 1 else category_1
-        course_1 = courses[0] if courses else "MBBS"
-        round_1 = rounds[0] if rounds else "R1"
-
-        return {
-            "suggestions": [
-                f"Best {course_1} colleges in {state_1} under rank 5000",
-                f"Top government colleges for {category_1} in {state_2}",
-                f"Lowest fee {course_1} colleges in {state_1} for rank 12000",
-                f"{category_2} cutoff trend in {state_2} for round {round_1}",
-                f"Top colleges in {state_1} with score above 620",
-            ]
-        }
-    except Exception:
-        logger.exception("Suggestion generation failed, using fallback")
-        # Non-critical endpoint fallback.
-        return {
-            "suggestions": [
-                "Best MBBS colleges in Karnataka under rank 5000",
-                "Top government colleges for OBC in Maharashtra",
-                "Lowest fee MBBS options in Tamil Nadu for rank 12000",
-                "General category MBBS cutoffs in Rajasthan round 2",
-                "Top colleges in MCC counselling under rank 3000",
-            ]
-        }
+    return {"suggestions": DEFAULT_SUGGESTIONS}
