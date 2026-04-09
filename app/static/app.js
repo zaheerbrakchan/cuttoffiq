@@ -47,9 +47,6 @@ function renderChat(messages) {
         ? "bg-indigo-600 text-white rounded-br-md"
         : "bg-white border border-slate-200 text-slate-800 rounded-bl-md",
     ].join(" ");
-    if (!isUser && m.needsClarification) {
-      bubble.classList.add("border-amber-300", "bg-amber-50/90");
-    }
     bubble.innerHTML = `<p class="text-[10px] uppercase tracking-wide opacity-70 mb-1">${isUser ? "You" : "Counsellor"}</p><div class="whitespace-pre-wrap">${escapeHtml(m.content)}</div>`;
     wrap.appendChild(bubble);
     chatThreadEl.appendChild(wrap);

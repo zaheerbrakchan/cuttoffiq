@@ -52,11 +52,15 @@ def save_user_chat_context(
 
 
 def clear_user_chat_context(client: Client, user_id: int) -> None:
+    """Clear chat history but KEEP user preferences (so they don't need to re-onboard)."""
+    # First, load existing preferences
+    existing = load_user_chat_context(client, user_id)
+    
     payload = {
         "user_id": user_id,
         "summary_text": "",
         "recent_chats": [],
-        "preferences_json": {},
+        "preferences_json": existing.get("preferences_json", {}),  # Keep preferences!
     }
     client.table("user_chat_context").upsert(payload).execute()
-    logger.info("Cleared chat context for user_id=%s", user_id)
+    logger.info("Cleared chat history for user_id=%s (preferences preserved)", user_id)
