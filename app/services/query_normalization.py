@@ -1,5 +1,5 @@
 """
-Map user-facing state/course wording to exact values stored in `neet_cutoffs`.
+Map user-facing state/course wording to exact values stored in `neet_ug_2025_cutoffs`.
 
 DB uses short codes (e.g. J&K, TAMILNADU) while users often say full names.
 """

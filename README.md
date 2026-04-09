@@ -24,7 +24,14 @@ copy .env.example .env
 Then set:
 - `OPENAI_API_KEY`
 - `SUPABASE_URL` (HTTP project URL)
-- `SUPABASE_KEY` (service key)
+- `SUPABASE_KEY`
+- `NEET_DATA_YEAR` (optional, default `2025`; shown in counsellor notes after DB results)
+
+Incomplete questions (e.g. only a NEET score) trigger a **clarification** response asking for **category**, **state or MCC/all India**, and **government vs private vs deemed** before running SQL.
+
+### Chat mode
+
+The web UI is a **ChatGPT-style thread**. Active memory is stored in the `user_chat_context` table and loaded from backend endpoints. Use **Clear chat** to reset server-side context for the current user. Runtime context currently uses the **latest 8 conversation messages** (summary generation is intentionally disabled for token efficiency).
 
 ## Run
 
@@ -52,6 +59,7 @@ This repo is ready for Railway with `Procfile` + `railway.json`.
    - `OPENAI_API_KEY`
    - `SUPABASE_URL` (must be `https://...supabase.co`)
    - `SUPABASE_KEY`
+   - `NEET_DATA_YEAR` (optional)
 5. Deploy.
 
 Railway start command used:
