@@ -16,7 +16,11 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
-from app.services.query_normalization import CANONICAL_STATES, resolve_state
+from app.services.query_normalization import (
+    CANONICAL_STATES,
+    resolve_state,
+    resolve_state_from_message,
+)
 
 logger = logging.getLogger("neet_assistant.onboarding")
 
@@ -50,6 +54,54 @@ COURSE_OPTIONS = [
     {"value": "BDS_INDIA", "label": "BDS in India"},
     {"value": "MBBS_ABROAD", "label": "MBBS Abroad"},
 ]
+
+# Onboarding "course" step values only (not NEET course column MBBS/BDS).
+COURSE_PREFERENCE_VALUES = frozenset(opt["value"] for opt in COURSE_OPTIONS)
+
+
+def normalize_misplaced_course_category(preferences: dict | None) -> dict:
+    """
+    Fix LLM mistakes: MBBS_INDIA / BDS_INDIA / MBBS_ABROAD must live under `course`,
+    not reservation `category`.
+
+    Also coerces `college_type` from a bare string into a one-element list so callers
+    never treat it like an iterable of characters.
+    """
+    prefs = dict(preferences or {})
+    raw = prefs.get("category")
+    if not isinstance(raw, str):
+        _coerce_college_type_to_list(prefs)
+        return prefs
+    canonical = None
+    stripped = raw.strip()
+    if stripped in COURSE_PREFERENCE_VALUES:
+        canonical = stripped
+    else:
+        u = stripped.upper()
+        for v in COURSE_PREFERENCE_VALUES:
+            if v.upper() == u:
+                canonical = v
+                break
+    if not canonical:
+        _coerce_college_type_to_list(prefs)
+        return prefs
+    if not prefs.get("course"):
+        prefs["course"] = canonical
+    prefs.pop("category", None)
+    logger.info("Normalized misplaced course preference from category to course=%s", canonical)
+    _coerce_college_type_to_list(prefs)
+    return prefs
+
+
+def _coerce_college_type_to_list(prefs: dict) -> None:
+    """LLM/onboarding sometimes store college_type as a string; keep a list for multi-select."""
+    ct = prefs.get("college_type")
+    if isinstance(ct, str):
+        s = ct.strip()
+        prefs["college_type"] = [s] if s else []
+    elif ct is not None and not isinstance(ct, list):
+        prefs["college_type"] = []
+
 
 # State options for display (user-friendly names)
 STATE_OPTIONS = [
@@ -110,6 +162,14 @@ def db_sub_categories_to_options(sub_categories: list[str]) -> list[dict]:
             if sub and sub.strip():
                 options.append({"value": sub, "label": sub})
     return options
+
+
+def db_college_types_to_options(college_types: list[str]) -> list[dict]:
+    """Convert database college_type strings to option dicts."""
+    if not college_types:
+        return COLLEGE_TYPE_OPTIONS.copy()
+    # Keep original DB values but title-case label for readability.
+    return [{"value": ct, "label": ct.title()} for ct in college_types if ct and ct.strip()]
 
 
 def get_step_confirmation(step: str, preferences: dict) -> str:
@@ -193,6 +253,7 @@ def get_onboarding_question(
     *,
     db_categories: list[dict] | None = None,
     db_sub_categories: list[dict] | None = None,
+    db_college_types: list[dict] | None = None,
 ) -> tuple[str, list[dict] | None]:
     """Get the question and options for a given onboarding step."""
     if step == "intro":
@@ -234,16 +295,15 @@ def get_onboarding_question(
         # Use dynamic sub-categories from database if provided
         options = db_sub_categories if db_sub_categories else FALLBACK_SUB_CATEGORIES
         return (
-            "Any special quota (PwD, Defense, NRI, etc.)? Say 'None' if not applicable.\n\n"
-            + _format_options_text(options),
+            "Please select your sub-category (or choose None):\n\n" + _format_options_text(options),
             options,
         )
     
     elif step == "college_type":
-        options = COLLEGE_TYPE_OPTIONS
+        options = db_college_types if db_college_types else COLLEGE_TYPE_OPTIONS
         return (
             "What type of colleges are you interested in?\n\n"
-            "You can select multiple options (e.g., 1, 2, 3 or Government, Private):\n\n"
+            "You can select multiple options:\n\n"
             + _format_options_text(options),
             options,
         )
@@ -256,6 +316,7 @@ def check_onboarding_status(
     *,
     db_categories: list[dict] | None = None,
     db_sub_categories: list[dict] | None = None,
+    db_college_types: list[dict] | None = None,
 ) -> OnboardingStatus:
     """
     Check if onboarding is complete and determine the current step.
@@ -290,6 +351,7 @@ def check_onboarding_status(
                 step, preferences,
                 db_categories=db_categories,
                 db_sub_categories=db_sub_categories,
+                db_college_types=db_college_types,
             )
             
             return OnboardingStatus(
@@ -387,11 +449,15 @@ def _match_option(text: str, options: list[dict]) -> dict | None:
         if text == opt["label"].lower():
             return opt
     
-    # Check for partial match
+    # Check for partial match (guarded to avoid tiny-token false positives like "st" from "state")
     for opt in options:
-        if text in opt["value"].lower() or text in opt["label"].lower():
+        opt_value = opt["value"].lower()
+        opt_label = opt["label"].lower()
+        if len(text) >= 3 and (text in opt_value or text in opt_label):
             return opt
-        if opt["value"].lower() in text or opt["label"].lower() in text:
+        if len(opt_value) >= 3 and opt_value in text:
+            return opt
+        if len(opt_label) >= 3 and opt_label in text:
             return opt
     
     return None
@@ -404,6 +470,7 @@ def process_onboarding_response(
     *,
     db_categories: list[dict] | None = None,
     db_sub_categories: list[dict] | None = None,
+    db_college_types: list[dict] | None = None,
 ) -> tuple[dict, str | None]:
     """
     Process user response for current onboarding step.
@@ -413,6 +480,26 @@ def process_onboarding_response(
     """
     user_input = user_input.strip()
     updated_prefs = preferences.copy() if preferences else {}
+
+    # Global correction handling: user may correct home state at any later step.
+    # Example: "sorry my state was UP"
+    lower_input = user_input.lower()
+    state_correction_hint = (
+        "home state" in lower_input
+        or "domicile" in lower_input
+        or re.search(r"\bstate\b", lower_input) is not None
+    )
+    if state_correction_hint:
+        corrected_state = resolve_state_from_message(user_input)
+        if corrected_state and corrected_state != updated_prefs.get("home_state"):
+            updated_prefs["home_state"] = corrected_state
+            # Dependent fields must be recollected for the new state.
+            updated_prefs.pop("category", None)
+            updated_prefs.pop("sub_category", None)
+            updated_prefs["_correction_note"] = (
+                f"Got it, I've updated the home state to {corrected_state}. Let's continue."
+            )
+            return updated_prefs, None
     
     if current_step == "intro":
         # User confirms they want to proceed with college prediction
@@ -577,14 +664,15 @@ def process_onboarding_response(
             parts = re.split(r'[,\s]+|(?:\s+and\s+)', user_input)
             parts = [p.strip() for p in parts if p.strip()]
             
+            options = db_college_types if db_college_types else COLLEGE_TYPE_OPTIONS
             for part in parts:
-                matched = _match_option(part, COLLEGE_TYPE_OPTIONS)
+                matched = _match_option(part, options)
                 if matched and matched["value"] not in selected_types:
                     selected_types.append(matched["value"])
                 else:
                     # Try direct match
                     part_upper = part.upper()
-                    for opt in COLLEGE_TYPE_OPTIONS:
+                    for opt in options:
                         if (part_upper == opt["value"].upper() or 
                             part_upper in opt["value"].upper() or
                             opt["value"].upper() in part_upper):

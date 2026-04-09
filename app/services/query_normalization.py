@@ -311,6 +311,58 @@ def resolve_state(text: str) -> str | None:
     return None
 
 
+def resolve_state_from_message(text: str) -> str | None:
+    """
+    Find a canonical state mentioned in free-form text (corrections, full sentences).
+
+    Uses explicit phrases like "home state is …" first, then scans known state
+    aliases; when several states appear, the last match usually reflects the user's
+    intended correction (e.g. mistakenly said kerela … home state is karnataka).
+    """
+    if not text or not str(text).strip():
+        return None
+    stripped = text.strip()
+    direct = resolve_state(stripped)
+    if direct:
+        return direct
+
+    explicit_patterns = (
+        r"(?:home\s+state|domicile(?:\s+state)?)\s+is\s+([^\n\.,;?!]+)",
+        r"(?:^|[\s,;])\s*state\s+is\s+([^\n\.,;?!]+)",
+    )
+    for pat in explicit_patterns:
+        m = re.search(pat, stripped, re.IGNORECASE)
+        if m:
+            chunk = m.group(1).strip()
+            chunk = re.split(
+                r"\s+(?:and|also|thanks|please)\b",
+                chunk,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].strip()
+            rs = resolve_state(chunk)
+            if rs:
+                return rs
+
+    tl = stripped.lower()
+    matches: list[tuple[int, str]] = []
+    for alias, canon in sorted(STATE_ALIASES.items(), key=lambda x: -len(x[0])):
+        if len(alias) < 2:
+            continue
+        parts = alias.split()
+        if len(parts) == 1:
+            rx = r"\b" + re.escape(parts[0]) + r"\b"
+        else:
+            rx = r"\b" + r"\s+".join(re.escape(p) for p in parts) + r"\b"
+        for m in re.finditer(rx, tl):
+            matches.append((m.start(), canon))
+
+    if not matches:
+        return None
+    matches.sort(key=lambda x: x[0])
+    return matches[-1][1]
+
+
 def resolve_course(text: str) -> str | None:
     key = _normalize_key(text)
     if key == "nursing":

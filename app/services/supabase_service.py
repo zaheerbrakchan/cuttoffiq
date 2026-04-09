@@ -82,3 +82,15 @@ def get_sub_categories_for_state_and_category(client: Client, state: str, catego
     sql = f"SELECT DISTINCT sub_category FROM neet_ug_2025_cutoffs WHERE state ILIKE '{state}' AND category ILIKE '{category}' AND sub_category IS NOT NULL ORDER BY sub_category"
     rows = execute_neet_query(client, sql)
     return _scalar_values(rows, "sub_category")
+
+
+def get_college_types_for_state(client: Client, state: str) -> list[str]:
+    """Fetch distinct college_type values available for a specific state."""
+    if not state:
+        return []
+    sql = (
+        "SELECT DISTINCT college_type FROM neet_ug_2025_cutoffs "
+        f"WHERE state ILIKE '{state}' AND college_type IS NOT NULL ORDER BY college_type"
+    )
+    rows = execute_neet_query(client, sql)
+    return _scalar_values(rows, "college_type")

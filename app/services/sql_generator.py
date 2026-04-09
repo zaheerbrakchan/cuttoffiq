@@ -42,12 +42,32 @@ domicile:     {_DOMICILE_LIST}
 
 ---
 
+SINGLE TABLE, LIMITED COLUMNS:
+- All answers come from neet_ug_2025_cutoffs only.
+- Filters almost always use: state, course, college_type, category, sub_category, domicile, air_rank, score, round, college_name.
+- There are no other tables; never invent columns.
+
+STRING LITERALS AND ENUM COLUMNS (read carefully):
+- Each allowed value above is stored as ONE token in the database. In SQL you must use one quoted string per token.
+- CORRECT: college_type = 'GOVERNMENT'
+- CORRECT: college_type IN ('GOVERNMENT', 'Private')
+- WRONG AND FORBIDDEN: splitting a word into characters, e.g. college_type IN ('G','O','V','E','R','N','M','E','N','T').
+- Same rule for state ('KARNATAKA' is one literal), course ('MBBS' is one literal), category ('GENERAL' is one literal), domicile ('DOMICILE' is one literal).
+- Match capitalization/spelling exactly as in the lists (e.g. Private with capital P; GOVERNMENT in ALL CAPS).
+
+WHEN THE USER MESSAGE INCLUDES "PROFILE_SQL_HINTS":
+- That block lists authoritative spellings from the student's saved profile for this request.
+- For eligibility / "what can I get" queries, apply those hints in WHERE unless the student's wording in the same message clearly overrides (e.g. they ask for private only).
+
+---
+
 CRITICAL LOGIC RULES:
 
 1. SCORE vs RANK (never mix):
-   - score = NEET marks (0–720) → filter: score >= [student_score] - 30 AND score <= [student_score] + 20
-   - air_rank = All India Rank (higher = worse) → filter: air_rank >= [student_rank] * 0.85 AND air_rank <= [student_rank] * 1.4
-   (This range captures realistic "safe", "moderate", and "reach" colleges)
+   - STRICT eligibility/options rules (NO BETWEEN ranges):
+     * score = NEET marks (0–720) -> use ONLY score <= [student_score]
+     * air_rank = All India Rank  -> use ONLY air_rank >= [student_rank]
+   - Never generate score windows or air_rank BETWEEN windows for eligibility/options questions.
 
 2. DOMICILE LOGIC:
    - Student's home state = queried state → domicile IN ('DOMICILE', 'OPEN')
@@ -91,6 +111,14 @@ ORDER BY air_rank ASC
 LIMIT 50
 """
 logger = logging.getLogger("neet_assistant.sql")
+_MAX_LOG_CHARS = 5000
+
+
+def _clip(text: str, limit: int = _MAX_LOG_CHARS) -> str:
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... [truncated {len(text) - limit} chars]"
 
 
 def _clean_sql(raw_sql: str) -> str:
@@ -134,18 +162,215 @@ def _strip_limit(sql: str) -> str:
     return re.sub(r"\blimit\s+\d+\b", "", sql, flags=re.IGNORECASE).strip()
 
 
+def ensure_output_columns(sql: str) -> str:
+    """
+    Ensure result projection always includes both air_rank and score.
+    If query uses SELECT *, leave unchanged.
+    """
+    m = re.search(r"^\s*select\s+(.*?)\s+from\s", sql, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        return sql
+    select_list = m.group(1).strip()
+    if re.search(r"^\*$", select_list) or re.search(r"\b\w+\.\*\b", select_list):
+        return sql
+
+    needed: list[str] = []
+    if not re.search(r"\bair_rank\b", select_list, flags=re.IGNORECASE):
+        needed.append("air_rank")
+    if not re.search(r"\bscore\b", select_list, flags=re.IGNORECASE):
+        needed.append("score")
+    if not needed:
+        return sql
+
+    new_select_list = f"{select_list}, {', '.join(needed)}"
+    start, end = m.span(1)
+    fixed = f"{sql[:start]}{new_select_list}{sql[end:]}"
+    logger.info("Added missing output columns to SELECT: %s", ", ".join(needed))
+    return fixed
+
+
+def _extract_latest_student_message(context: str) -> str:
+    marker = "Student (latest message):"
+    idx = context.rfind(marker)
+    if idx == -1:
+        return context
+    return context[idx + len(marker) :].strip()
+
+
+def _extract_recent_student_messages(context: str) -> list[str]:
+    msgs: list[str] = []
+    for line in (context or "").splitlines():
+        line = line.strip()
+        if line.startswith("Student (latest message):"):
+            content = line.split("Student (latest message):", 1)[1].strip()
+            if content:
+                msgs.append(content)
+        elif line.startswith("Student:"):
+            content = line.split("Student:", 1)[1].strip()
+            if content:
+                msgs.append(content)
+    if not msgs and context.strip():
+        msgs.append(context.strip())
+    return msgs
+
+
+def _extract_rank_value(text: str) -> int | None:
+    # Prefer explicit "my rank" pattern first.
+    own = _extract_user_air(text)
+    if own is not None:
+        return own
+    # Then accept generic AIR/rank mentions (friend/he/she statements).
+    ranks = sorted(_numbers_tied_to_air_rank(text))
+    if ranks:
+        return ranks[-1]
+    return None
+
+
 def _extract_primary_metric_target(context: str) -> tuple[str, int] | None:
     """
     Returns ("air_rank", value) or ("score", value) from user context when available.
     Preference: explicit rank/AIR first, then explicit score/marks.
     """
-    user_air = _extract_user_air(context)
+    latest = _extract_latest_student_message(context)
+
+    # Prefer explicit metric from latest user message.
+    user_air = _extract_user_air(latest)
     if user_air is not None:
         return ("air_rank", user_air)
-    score_nums = sorted(_numbers_tied_to_neet_score(context))
+    score_nums = sorted(_numbers_tied_to_neet_score(latest))
     if score_nums:
-        return ("score", score_nums[0])
+        return ("score", score_nums[-1])
+
+    # IMPORTANT: Do not fallback to older memory turns.
+    # Metric target must come from latest message only to avoid cross-turn leakage.
     return None
+
+
+def _is_options_style_question(context: str) -> bool:
+    low = context.lower()
+    return bool(
+        re.search(
+            r"\b(which colleges|can (?:i|he|she) get|options?|possible colleges|looking option|eligible)\b",
+            low,
+        )
+    )
+
+
+def enforce_score_ceiling_for_options(context: str, sql: str) -> str:
+    """
+    For options/eligibility questions with stated NEET marks, ensure SQL never
+    fetches rows above the student's own score.
+    """
+    latest = _extract_latest_student_message(context)
+    if not _is_options_style_question(latest):
+        return sql
+
+    score_nums = sorted(_numbers_tied_to_neet_score(latest))
+    if not score_nums:
+        return sql
+    score_ceiling = score_nums[-1]
+
+    out = sql
+
+    def _rewrite_between(m: re.Match[str]) -> str:
+        a = int(m.group(1))
+        b = int(m.group(2))
+        low = min(a, b)
+        high = min(max(a, b), score_ceiling)
+        if low > high:
+            low = high
+        return f"score BETWEEN {low} AND {high}"
+
+    out = re.sub(
+        r"\bscore\s+between\s+(\d{1,4})\s+and\s+(\d{1,4})\b",
+        _rewrite_between,
+        out,
+        flags=re.IGNORECASE,
+    )
+
+    has_score_cap = bool(
+        re.search(rf"\bscore\s*<=\s*{score_ceiling}\b", out, flags=re.IGNORECASE)
+        or re.search(
+            rf"\bscore\s+between\s+\d{{1,4}}\s+and\s+{score_ceiling}\b",
+            out,
+            flags=re.IGNORECASE,
+        )
+    )
+    if not has_score_cap:
+        out = _append_where_condition(out, f"score <= {score_ceiling}")
+    logger.info("Applied options score ceiling: score <= %s", score_ceiling)
+    return out
+
+
+def enforce_strict_metric_rules(
+    context: str,
+    sql: str,
+    *,
+    extracted: dict[str, object] | None = None,
+) -> str:
+    """
+    Strict eligibility rule (latest message only):
+    - score-based: score <= student's score (no ranges)
+    - rank-based: air_rank >= student's rank (no ranges)
+    """
+    extracted = extracted or {}
+    mode = str(extracted.get("query_mode", "")).lower()
+    metric_type = str(extracted.get("metric_type", "")).lower()
+    metric_value_raw = extracted.get("metric_value")
+    metric_value = int(metric_value_raw) if isinstance(metric_value_raw, (int, float)) else None
+
+    # Apply strict metric rewriting only for eligibility mode.
+    # If mode is missing/unknown, keep backward-compatible behavior.
+    if mode and mode not in ("eligibility", "unknown"):
+        return sql
+
+    latest = _extract_latest_student_message(context)
+    metric_source = latest
+    if not _numbers_tied_to_neet_score(metric_source) and _extract_rank_value(metric_source) is None:
+        msgs = _extract_recent_student_messages(context)
+        # Look backward for nearest student message carrying score/rank.
+        for msg in reversed(msgs[:-1]):
+            if _numbers_tied_to_neet_score(msg) or _extract_rank_value(msg) is not None:
+                metric_source = msg
+                break
+    out = sql
+
+    # STRICT SCORE RULE (prefer LLM extracted metric when available)
+    score_nums = [metric_value] if metric_type == "score" and metric_value is not None else sorted(_numbers_tied_to_neet_score(metric_source))
+    if score_nums:
+        n = score_nums[-1]
+        out = re.sub(
+            r"\bscore\s+between\s+\d{1,4}\s+and\s+\d{1,4}\b",
+            f"score <= {n}",
+            out,
+            flags=re.IGNORECASE,
+        )
+        out = re.sub(r"\bscore\s*>=\s*\d{1,4}\b", f"score <= {n}", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bscore\s*<\s*\d{1,4}\b", f"score <= {n}", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bscore\s*=\s*\d{1,4}\b", f"score <= {n}", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bscore\s*<=\s*\d{1,4}\b", f"score <= {n}", out, flags=re.IGNORECASE)
+        if not re.search(r"\bscore\s*<=\s*\d{1,4}\b", out, flags=re.IGNORECASE):
+            out = _append_where_condition(out, f"score <= {n}")
+        logger.info("Enforced STRICT score rule: score <= %s (source=%s)", n, metric_source)
+
+    # STRICT RANK RULE (prefer LLM extracted metric when available)
+    rank = metric_value if metric_type == "rank" and metric_value is not None else _extract_rank_value(metric_source)
+    if rank is not None:
+        out = re.sub(
+            r"\bair_rank\s+between\s+\d{1,7}\s+and\s+\d{1,7}\b",
+            f"air_rank >= {rank}",
+            out,
+            flags=re.IGNORECASE,
+        )
+        out = re.sub(r"\bair_rank\s*<=\s*\d{1,7}\b", f"air_rank >= {rank}", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bair_rank\s*<\s*\d{1,7}\b", f"air_rank >= {rank}", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bair_rank\s*=\s*\d{1,7}\b", f"air_rank >= {rank}", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bair_rank\s*>=\s*\d{1,7}\b", f"air_rank >= {rank}", out, flags=re.IGNORECASE)
+        if not re.search(r"\bair_rank\s*>=\s*\d{1,7}\b", out, flags=re.IGNORECASE):
+            out = _append_where_condition(out, f"air_rank >= {rank}")
+        logger.info("Enforced STRICT AIR rule: air_rank >= %s (source=%s)", rank, metric_source)
+
+    return out
 
 
 def apply_distinct_colleges(sql: str, *, context: str, limit: int = 50) -> str:
@@ -235,8 +460,19 @@ def _is_personalized_eligibility_question(context: str) -> bool:
     eligibility_hints = [
         "which colleges can i get",
         "can i get",
+        "can he get",
+        "can she get",
         "colleges i can",
+        "colleges he can",
+        "colleges she can",
         "options for me",
+        "looking for",
+        "help with options",
+        "for my friend",
+        "his rank",
+        "her rank",
+        "his score",
+        "her score",
         "my options",
         "what are my",
         "eligible for",
@@ -254,61 +490,122 @@ def _is_personalized_eligibility_question(context: str) -> bool:
     return any(hint in low for hint in eligibility_hints)
 
 
+def _sql_hint_escape(value: str) -> str:
+    return (value or "").replace("'", "''")
+
+
+def _build_profile_sql_hints(
+    *,
+    user_home_state: str | None,
+    user_category: str | None,
+    user_college_types: list[str] | None,
+) -> str:
+    """
+    Injected into the SQL LLM user message so the model applies exact DB tokens
+    (no post-hoc string splitting or regex fixes).
+    """
+    types = [t for t in (user_college_types or []) if t and str(t).strip() and str(t).strip().upper() != "ALL"]
+    if not (user_home_state or user_category or types):
+        return ""
+
+    lines = [
+        "PROFILE_SQL_HINTS (mandatory when present — copy these tokens verbatim into WHERE; "
+        "each is ONE string literal, never character-by-character):",
+    ]
+    if user_home_state:
+        h = _sql_hint_escape(user_home_state.strip().upper())
+        lines.append(f"- Student home state (state column): '{h}'")
+    if user_category:
+        c = _sql_hint_escape(str(user_category).strip().upper())
+        lines.append(
+            f"- Reservation category (category column): include '{c}' per CATEGORY HANDLING rules "
+            f"(expand with related categories when rules say so)."
+        )
+    if len(types) == 1:
+        t0 = _sql_hint_escape(str(types[0]).strip())
+        lines.append(f"- Preferred college_type: college_type = '{t0}'")
+    elif len(types) > 1:
+        in_list = ", ".join(f"'{_sql_hint_escape(str(t).strip())}'" for t in types)
+        lines.append(f"- Preferred college_type: college_type IN ({in_list})")
+    return "\n".join(lines)
+
+
 def apply_eligibility_filters(
     sql: str,
     *,
     user_home_state: str | None,
     user_category: str | None = None,
-    user_college_types: list[str] | None = None,
     user_context: str = "",
+    is_eligibility: bool | None = None,
 ) -> str:
     """
-    Intelligently add domicile, category, and college_type filters to queries for eligibility questions.
-    - Only for eligibility-type questions (user asking what they can get)
-    - Skip for general cutoff lookups, specific college queries, trend comparisons
-    - Adds filters based on user preferences when not explicitly mentioned in query
+    Add domicile and category filters for eligibility questions when needed.
+    college_type is handled by the SQL LLM via PROFILE_SQL_HINTS in generate_sql.
     """
-    # Only add filters for eligibility questions
-    if not _is_personalized_eligibility_question(user_context):
+    # Prefer LLM-extracted mode when available; fallback to phrase heuristic.
+    effective_eligibility = is_eligibility if is_eligibility is not None else _is_personalized_eligibility_question(user_context)
+    if not effective_eligibility:
         logger.info("Not an eligibility question, skipping auto-filters")
         return sql
     
     result_sql = sql
-    
+
+    # Determine target state from SQL first (needed for category + domicile rules)
+    m = re.search(
+        r"\bstate\s*(?:=|ilike)\s*['\"]([^'\"]+)['\"]",
+        result_sql,
+        flags=re.IGNORECASE,
+    )
+    target_state = None
+    if m:
+        raw_target = m.group(1).strip().strip("%")
+        target_state = resolve_state(raw_target) or raw_target.strip().upper()
+
+    home_state = None
+    if user_home_state:
+        home_state = resolve_state(user_home_state) or user_home_state.strip().upper()
+
+    is_mcc_or_all_india = _is_mcc_or_all_india_query(result_sql) or target_state == "MCC"
+    is_other_state = bool(target_state and home_state and target_state != home_state and not is_mcc_or_all_india)
+
     # --- CATEGORY FILTER ---
     has_category_filter = bool(
-        re.search(r"\bcategory\s+in\s*\(", sql, flags=re.IGNORECASE) or
-        re.search(r"\bcategory\s*(?:=|ilike)\s*['\"]", sql, flags=re.IGNORECASE)
+        re.search(r"\bcategory\s+in\s*\(", result_sql, flags=re.IGNORECASE)
+        or re.search(r"\bcategory\s*(?:=|ilike)\s*['\"]", result_sql, flags=re.IGNORECASE)
     )
-    
-    if not has_category_filter and user_category:
-        # Add category filter for better results
+
+    if is_other_state:
+        # Other-state counselling should ALWAYS be treated as open/general bucket.
+        # Remove existing category predicates first, then enforce GENERAL/OPEN.
+        result_sql = re.sub(
+            r"\s+and\s+\(?\s*category\s*(?:=|ilike)\s*'[^']+'\s*\)?",
+            "",
+            result_sql,
+            flags=re.IGNORECASE,
+        )
+        result_sql = re.sub(
+            r"\s+and\s+\(?\s*category\s+in\s*\([^)]+\)\s*\)?",
+            "",
+            result_sql,
+            flags=re.IGNORECASE,
+        )
+        category_condition = "(category ILIKE '%GENERAL%' OR category ILIKE '%GEN%' OR category ILIKE '%OPEN%')"
+        result_sql = _append_where_condition(result_sql, category_condition)
+        logger.info(
+            "Applied enforced other-state category rule (home=%s, target=%s): %s",
+            home_state,
+            target_state,
+            category_condition,
+        )
+    elif has_category_filter:
+        logger.info("Category filter already present in SQL")
+    elif user_category:
         category_condition = f"category ILIKE '%{user_category}%'"
         result_sql = _append_where_condition(result_sql, category_condition)
         logger.info("Applied category filter: %s", category_condition)
-    elif has_category_filter:
-        logger.info("Category filter already present in SQL")
-    
-    # --- COLLEGE TYPE FILTER ---
-    has_college_type_filter = bool(
-        re.search(r"\bcollege_type\s+in\s*\(", result_sql, flags=re.IGNORECASE) or
-        re.search(r"\bcollege_type\s*(?:=|ilike)\s*['\"]", result_sql, flags=re.IGNORECASE)
-    )
-    
-    # Only add college_type filter if user has preferences and not "ALL"
-    if not has_college_type_filter and user_college_types:
-        # Skip if user selected "ALL" or list is empty
-        if "ALL" not in user_college_types and len(user_college_types) > 0:
-            if len(user_college_types) == 1:
-                college_type_condition = f"college_type = '{user_college_types[0]}'"
-            else:
-                types_str = "', '".join(user_college_types)
-                college_type_condition = f"college_type IN ('{types_str}')"
-            result_sql = _append_where_condition(result_sql, college_type_condition)
-            logger.info("Applied college_type filter: %s", college_type_condition)
-    elif has_college_type_filter:
-        logger.info("College type filter already present in SQL")
-    
+
+    # college_type: SQL LLM + PROFILE_SQL_HINTS in generate_sql (no post-append here).
+
     # --- DOMICILE FILTER ---
     has_domicile_filter = bool(
         re.search(r"\bdomicile\s+in\s*\(", result_sql, flags=re.IGNORECASE) or
@@ -319,23 +616,6 @@ def apply_eligibility_filters(
         logger.info("Domicile filter already present in SQL, skipping auto-add")
         return result_sql
     
-    # Determine target state from SQL
-    m = re.search(
-        r"\bstate\s*(?:=|ilike)\s*['\"]([^'\"]+)['\"]",
-        result_sql,
-        flags=re.IGNORECASE,
-    )
-    
-    target_state = None
-    if m:
-        raw_target = m.group(1).strip().strip("%")
-        target_state = resolve_state(raw_target) or raw_target.strip().upper()
-    
-    # Normalize home state
-    home_state = None
-    if user_home_state:
-        home_state = resolve_state(user_home_state) or user_home_state.strip().upper()
-    
     # PRIORITY 1: Check if target state matches home state
     if target_state and home_state and target_state == home_state:
         domicile_condition = "domicile IN ('DOMICILE', 'OPEN')"
@@ -344,7 +624,7 @@ def apply_eligibility_filters(
             target_state, home_state, domicile_condition,
         )
     # PRIORITY 2: Check if MCC/All India query
-    elif _is_mcc_or_all_india_query(result_sql) or target_state == "MCC":
+    elif is_mcc_or_all_india:
         domicile_condition = "domicile IN ('NON-DOMICILE', 'OPEN')"
         logger.info("Applied domicile rule for MCC/All India: %s", domicile_condition)
     else:
@@ -368,7 +648,7 @@ _USER_OWN_RANK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _ELIGIBILITY_HINT = re.compile(
-    r"(which\s+colleges|can\s+i\s+get|colleges\s+i\s+can|eligible|options?\s+(?:for|with))",
+    r"(which\s+colleges|can\s+(?:i|he|she)\s+get|colleges\s+(?:i|he|she)\s+can|eligible|options?\s+(?:for|with)|looking\s+for|help\s+with\s+options?)",
     re.IGNORECASE,
 )
 
@@ -462,8 +742,10 @@ def fix_air_rank_score_confusion(context: str, sql: str) -> str:
     If the LLM put a NEET *mark* into air_rank, rewrite to use column score.
     Does not change SQL when the same number is clearly an AIR in context.
     """
-    score_nums = _numbers_tied_to_neet_score(context)
-    rank_nums = _numbers_tied_to_air_rank(context)
+    latest = _extract_latest_student_message(context)
+    # Use latest message only to avoid pulling old scores/ranks from memory history.
+    score_nums = _numbers_tied_to_neet_score(latest)
+    rank_nums = _numbers_tied_to_air_rank(latest)
     if not score_nums:
         return sql
 
@@ -471,7 +753,7 @@ def fix_air_rank_score_confusion(context: str, sql: str) -> str:
     for n in score_nums:
         if n in rank_nums:
             continue
-        wants_above = _wants_score_above_threshold(context, n)
+        wants_above = _wants_score_above_threshold(latest, n)
         # Default: eligibility by marks → score <= n (allotted marks at/below user's level)
         ge_repl = f"score >= {n}" if wants_above else f"score <= {n}"
         le_repl = f"score >= {n}" if wants_above else f"score <= {n}"
@@ -506,25 +788,47 @@ def fix_air_rank_eligibility_sql(question: str, sql: str) -> str:
     If the user asked about their own rank and eligibility, the model often wrongly uses
     air_rank <= R. Correct to air_rank >= R for allotment-based cutoff data.
     """
-    if not _is_eligibility_question(question):
+    latest = _extract_latest_student_message(question)
+    if not _is_eligibility_question(latest):
         return sql
-    user_air = _extract_user_air(question)
+    user_air = _extract_user_air(latest)
     if user_air is None:
         return sql
-    # Flip air_rank <= user_air  ->  air_rank >= user_air (same number)
-    pattern = re.compile(
-        rf"\bair_rank\s*<=\s*{user_air}\b",
-        re.IGNORECASE,
+    out = sql
+
+    # For "what can I get" with given rank, keep only worse-or-equal ranks (>= user rank).
+    # 1) Remove any upper-bound component from BETWEEN / <= style filters.
+    out = re.sub(
+        rf"\bair_rank\s+between\s+\d+\s+and\s+\d+\b",
+        f"air_rank >= {user_air}",
+        out,
+        flags=re.IGNORECASE,
     )
-    if pattern.search(sql):
-        fixed = pattern.sub(f"air_rank >= {user_air}", sql)
-        logger.info(
-            "Adjusted eligibility filter: air_rank <= %s -> air_rank >= %s",
-            user_air,
-            user_air,
-        )
-        return fixed
-    return sql
+    out = re.sub(
+        rf"\bair_rank\s*<=\s*\d+\b",
+        f"air_rank >= {user_air}",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        rf"\bair_rank\s*=\s*{user_air}\b",
+        f"air_rank >= {user_air}",
+        out,
+        flags=re.IGNORECASE,
+    )
+    # Normalize any existing lower-bound to the current user's rank.
+    out = re.sub(
+        rf"\bair_rank\s*>=\s*\d+\b",
+        f"air_rank >= {user_air}",
+        out,
+        flags=re.IGNORECASE,
+    )
+
+    if not re.search(r"\bair_rank\s*>=\s*\d+\b", out, flags=re.IGNORECASE):
+        out = _append_where_condition(out, f"air_rank >= {user_air}")
+
+    logger.info("Enforced eligibility AIR rule from latest message: air_rank >= %s", user_air)
+    return out
 
 
 def generate_sql(
@@ -534,37 +838,68 @@ def generate_sql(
     user_home_state: str | None = None,
     user_category: str | None = None,
     user_college_types: list[str] | None = None,
+    extracted: dict[str, object] | None = None,
+    request_id: str | None = None,
 ) -> str:
+    rid = request_id or "-"
     normalized = normalize_user_question(user_question)
-    logger.info("Generating SQL for question length=%d", len(user_question))
+    logger.info("[%s] Generating SQL for question length=%d", rid, len(user_question))
+    extracted = extracted or {}
+    mode = str(extracted.get("query_mode", "")).lower()
+    metric_type = str(extracted.get("metric_type", "")).lower()
+    metric_value = extracted.get("metric_value")
+    metric_directive = ""
+    if mode == "eligibility" and metric_type in ("score", "rank") and isinstance(metric_value, (int, float)):
+        if metric_type == "score":
+            metric_directive = f"STRICT_SQL_RULE: This is eligibility query. Use ONLY score <= {int(metric_value)}. Do not use BETWEEN."
+        else:
+            metric_directive = f"STRICT_SQL_RULE: This is eligibility query. Use ONLY air_rank >= {int(metric_value)}. Do not use BETWEEN."
+
+    profile_hints = _build_profile_sql_hints(
+        user_home_state=user_home_state,
+        user_category=user_category,
+        user_college_types=user_college_types,
+    )
+    parts = [p for p in (profile_hints.strip(), metric_directive.strip(), normalized.strip()) if p]
+    llm_user_message = "\n\n".join(parts)
+    logger.info("[%s] SQL LLM system prompt:\n%s", rid, _clip(SQL_SYSTEM_PROMPT.strip()))
+    logger.info("[%s] SQL LLM user prompt:\n%s", rid, _clip(llm_user_message))
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": SQL_SYSTEM_PROMPT.strip()},
-            {"role": "user", "content": normalized.strip()},
+            {"role": "user", "content": llm_user_message},
         ],
         temperature=0,
     )
 
     raw_sql = response.choices[0].message.content or ""
+    logger.info("[%s] SQL LLM raw output:\n%s", rid, _clip(raw_sql))
     sql = _ensure_limit(_clean_sql(raw_sql), limit=50)
+    logger.info("[%s] SQL after clean/limit:\n%s", rid, _clip(sql))
     sql = fix_sql_state_and_course(sql)
+    logger.info("[%s] SQL after state/course normalization:\n%s", rid, _clip(sql))
     sql = apply_eligibility_filters(
         sql,
         user_home_state=user_home_state,
         user_category=user_category,
-        user_college_types=user_college_types,
         user_context=normalized,
+        is_eligibility=(mode == "eligibility") if mode else None,
     )
+    logger.info("[%s] SQL after eligibility filters:\n%s", rid, _clip(sql))
+    sql = ensure_output_columns(sql)
     sql = fix_air_rank_score_confusion(normalized, sql)
     sql = fix_air_rank_eligibility_sql(normalized, sql)
+    sql = enforce_score_ceiling_for_options(normalized, sql)
+    sql = enforce_strict_metric_rules(normalized, sql, extracted=extracted)
+    logger.info("[%s] SQL after strict metric rules:\n%s", rid, _clip(sql))
     sql = apply_distinct_colleges(sql, context=normalized, limit=50)
-    logger.info("SQL after state/course normalization: %s", sql)
+    logger.info("[%s] Final SQL after distinct wrapping:\n%s", rid, _clip(sql))
 
     if not _is_safe_select(sql):
-        logger.warning("SQL blocked by safety checks: %s", sql)
+        logger.warning("[%s] SQL blocked by safety checks:\n%s", rid, _clip(sql))
         raise ValueError("Generated SQL failed safety checks.")
-    logger.info("SQL passed safety checks")
+    logger.info("[%s] SQL passed safety checks", rid)
     return sql
 
 
@@ -574,8 +909,18 @@ def generate_counsellor_answer(
     data: list[dict],
     *,
     data_year: str = "2025",
+    request_id: str | None = None,
 ) -> str:
-    logger.info("Generating counsellor answer for rows=%d", len(data))
+    rid = request_id or "-"
+    logger.info("[%s] Generating counsellor answer for rows=%d", rid, len(data))
+    if not data:
+        logger.info("[%s] Skipping answer LLM call due to zero rows", rid)
+        return (
+            "I checked this request carefully, but I couldn't find matching colleges in the current cutoff data for these exact filters.\n\n"
+            "If you want, I can widen the search by trying nearby states, broader college types, or a different category/state combination."
+            f"\n\n_Note: This information is based on allotment trends from {data_year}._"
+        )
+
     answer_prompt = f"""
 You are Anuj, a warm and knowledgeable NEET UG counselling assistant. You are talking with a student who is stressed and needs clear, honest, and caring guidance.
 
@@ -590,6 +935,11 @@ DATABASE RESULTS (JSON):
 ---
 
 YOUR RESPONSE GUIDELINES:
+CRITICAL ACCURACY RULES:
+- Use ONLY the current STUDENT'S QUESTION and the DATABASE RESULTS in this prompt.
+- Do NOT use memory from earlier chat turns.
+- Do NOT mention any college, rank, score, or state that is not present in DATABASE RESULTS.
+- If a value is missing in a row, show "-" instead of guessing.
 
 **TONE & STYLE:**
 - Talk like a caring senior who has seen hundreds of NEET students — not like a bot reading from a table.
@@ -604,9 +954,11 @@ YOUR RESPONSE GUIDELINES:
 
 2. MAIN ANSWER: Present the results clearly.
    - If colleges found: Group by college_type (Government first, then Private, then Deemed) or by state if cross-state.
-   - Show: College name | Course | Category | Last year's cutoff (rank or score) | Round
+   - ALWAYS show BOTH metrics in the college list/table:
+     College name | Course | Category | AIR Rank | Score | Round
+   - If one metric is missing in a row, show "-" for that cell.
    - Highlight 2–3 "you can likely get this" colleges vs 2–3 "stretch" options.
-   - For rank queries: use air_rank. For score queries: use score. NEVER mix them up.
+   - Never drop AIR Rank just because question is score-based, and never drop Score just because question is rank-based.
 
 3. HONEST INSIGHT (1–2 lines): Give a real counselling nudge.
    Example: "The cutoffs here are from {data_year} rounds — actual next year cutoffs may shift slightly, so treat these as estimates."
@@ -629,10 +981,12 @@ Don't just say "no results." Say something like:
 
 FORMAT:
 - Use simple bullet points or a small table for college lists (max 10–12 rows shown).
+- If using a table, mandatory headers are: College Name, Course, Category, AIR Rank, Score, Round.
 - Bold college names.
 - Keep total response under 300 words unless the question genuinely needs more.
 - End with a warm, action-oriented sentence — never a cold full stop.
 """
+    logger.info("[%s] Answer LLM user prompt:\n%s", rid, _clip(answer_prompt.strip()))
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -643,6 +997,7 @@ FORMAT:
         temperature=0.4,
     )
     body = (response.choices[0].message.content or "").strip()
+    logger.info("[%s] Answer LLM raw output:\n%s", rid, _clip(body))
     note = (
         f"\n\n_Note: This information is based on allotment trends from {data_year}._"
     )
