@@ -74,14 +74,14 @@ function renderTable(rows, suppressed) {
     tableBodyEl.innerHTML += `
       <tr class="border-b border-slate-100">
         <td class="py-2 pr-4">${escapeHtml(row.college_name || "-")}</td>
-        <td class="py-2 pr-4">${escapeHtml(row.state || "-")}</td>
         <td class="py-2 pr-4">${escapeHtml(row.college_type || "-")}</td>
         <td class="py-2 pr-4">${escapeHtml(row.category || "-")}</td>
+        <td class="py-2 pr-4">${escapeHtml(row.sub_category || "-")}</td>
+        <td class="py-2 pr-4">${escapeHtml(row.seat_type || "-")}</td>
+        <td class="py-2 pr-4">${escapeHtml(row.quota || "-")}</td>
+        <td class="py-2 pr-4">${escapeHtml(row.eligibility || "-")}</td>
         <td class="py-2 pr-4">${escapeHtml(row.air_rank || "-")}</td>
         <td class="py-2 pr-4">${escapeHtml(row.score || "-")}</td>
-        <td class="py-2 pr-4">${escapeHtml(row.quota || "-")}</td>
-        <td class="py-2 pr-4">${escapeHtml(row.course || "-")}</td>
-        <td class="py-2 pr-4">${escapeHtml(row.round || "-")}</td>
       </tr>
     `;
   });

@@ -124,7 +124,7 @@ STATE_OPTIONS = [
     {"value": "ODISHA", "label": "Odisha"},
     {"value": "PUNJAB", "label": "Punjab"},
     {"value": "RAJASTHAN", "label": "Rajasthan"},
-    {"value": "TAMILNADU", "label": "Tamil Nadu"},
+    {"value": "TAMIL NADU", "label": "Tamil Nadu"},
     {"value": "TELANGANA", "label": "Telangana"},
     {"value": "UTTAR PRADESH", "label": "Uttar Pradesh"},
     {"value": "UTTARAKHAND", "label": "Uttarakhand"},

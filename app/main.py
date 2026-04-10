@@ -25,6 +25,8 @@ from app.services.chat_context_service import (
 from app.services.conversation import (
     append_recent_chats,
     build_contextual_query,
+    build_isolated_context,
+    build_user_only_context,
 )
 from app.services.openai_service import get_openai_client
 from app.services.query_normalization import normalize_user_question, resolve_state
@@ -211,24 +213,19 @@ def _extract_college_types_from_text(text: str) -> list[str]:
 
 def _build_sql_context(latest_message: str, recent_chats: list[dict] | None) -> str:
     """
-    SQL-generation context: user-only short memory to avoid assistant-text contamination.
-    Keeps latest message plus up to last 3 prior user messages.
+    SQL-generation context: user messages only to avoid assistant result contamination.
+    
+    Why only user messages:
+    - User messages contain INPUT data (score, rank, state, category)
+    - Assistant messages contain SEARCH RESULTS (college names, cutoffs)
+    - Including results can make LLM use output numbers as input parameters
+    
+    The SQL LLM will:
+    - Aggregate data from user messages across turns
+    - Handle multi-subject conversations (e.g., friend 1, then friend 2)
+    - Understand confirmation messages ("yes please") in context
     """
-    latest = (latest_message or "").strip()
-    if not latest:
-        return ""
-    users: list[str] = []
-    for m in recent_chats or []:
-        if m.get("role") == "user":
-            content = (m.get("content") or "").strip()
-            if content:
-                users.append(content)
-    prior = users[-3:]
-    if prior:
-        lines = [f"Student: {x}" for x in prior]
-        lines.append(f"Student (latest message): {latest}")
-        return "\n".join(lines)
-    return latest
+    return build_user_only_context(latest_message, recent_chats, max_prior_user_msgs=4)
 
 
 def _is_mcc_target(state_text: str | None) -> bool:
@@ -242,12 +239,14 @@ def _enrich_query_with_preferences(
     combined_context: str,
 ) -> str:
     """
-    Provide user profile as context for the LLM to use intelligently.
+    Provide user profile for the LLM to use based on query type.
     
-    The profile serves as defaults/context, but:
-    - If user explicitly mentions different values in their query, those take precedence
-    - LLM decides when profile info is relevant to the current question
-    - Profile is provided as context, not forced into every query
+    Query types and profile usage:
+    - SELF query → Use profile as defaults (score, category, home_state, course)
+    - FRIEND query → Do NOT use profile (friend has different data)
+    - GENERAL query → Do NOT use profile (hypothetical, not about user)
+    
+    The LLM will determine query type and apply profile appropriately.
     """
     if not preferences:
         return combined_context
@@ -255,7 +254,7 @@ def _enrich_query_with_preferences(
     # Build profile summary
     profile_parts = []
     
-    # Add score/rank info
+    # Score/rank info
     score_info = preferences.get("neet_score", {})
     if score_info:
         if score_info.get("type") == "score":
@@ -263,34 +262,39 @@ def _enrich_query_with_preferences(
         else:
             profile_parts.append(f"NEET rank: AIR {score_info.get('value')}")
     
-    # Add category
+    # Category
     category = preferences.get("category")
     if category:
         profile_parts.append(f"category: {category}")
     
-    # Add home state
+    # Home state
     home_state = preferences.get("home_state")
     if home_state:
         profile_parts.append(f"home state: {home_state}")
     
-    # Add course preference
+    # Course preference
     course = preferences.get("course")
     if course:
-        profile_parts.append(f"course interest: {course.replace('_', '/')}")
+        profile_parts.append(f"course: {course.replace('_', '/')}")
     
-    # Add sub-category if present
+    # Sub-category
     sub_category = preferences.get("sub_category")
     if sub_category and sub_category != "NONE":
         profile_parts.append(f"sub-category: {sub_category}")
     
-    # college_type is normalized to a list when preferences are loaded/saved
+    # College types
     college_types = preferences.get("college_type") or []
     if isinstance(college_types, list) and college_types and "ALL" not in college_types:
         profile_parts.append(f"preferred college types: {', '.join(str(x) for x in college_types)}")
     
     if profile_parts:
-        # Provide profile as context for the LLM to use intelligently
-        prefix = "[User Profile: " + "; ".join(profile_parts) + "]\n\n"
+        prefix = (
+            f"[LOGGED-IN USER'S PROFILE]: {'; '.join(profile_parts)}\n\n"
+            f"PROFILE USAGE:\n"
+            f"• For SELF queries → Use profile as defaults\n"
+            f"• For FRIEND queries → Do NOT use (friend has different data)\n"
+            f"• For GENERAL queries → Do NOT use (hypothetical)\n\n"
+        )
         return prefix + combined_context
     
     return combined_context
@@ -430,30 +434,75 @@ def _handle_question(question: str, prior_messages: list[dict] | None = None) ->
     if needs_onboarding_processing:
         logger.info("[%s] Onboarding step: %s, preferences so far: %s", request_id, current_step, list(preferences_json.keys()))
         
-        # Brand new user - show welcome/intro message
+        # Brand new user - check what they said and respond contextually
         if not already_started_onboarding and current_step == "intro":
-            answer = onboarding_status.next_question
-            recent = append_recent_chats(
-                recent_chats,
-                user_text=question,
-                assistant_text=answer,
+            # Use LLM to classify user's intent from their first message
+            intro_intent = classify_intro_step_intent(
+                openai_client,
+                question,
+                request_id=request_id,
             )
-            save_user_chat_context(
-                supabase_client,
-                user_id=user_id,
-                summary_text=context_row.get("summary_text", ""),
-                recent_chats=recent,
-                preferences_json=preferences_json,
-            )
-            return {
-                "sql": None,
-                "data": [],
-                "answer": answer,
-                "needs_clarification": True,
-                "data_year": data_year,
-                "onboarding_step": current_step,
-                "onboarding_options": onboarding_status.options,
-            }
+            
+            if intro_intent == "provided_neet_metric":
+                # User already gave score/rank - skip intro entirely, process it
+                preferences_json["intro"] = "confirmed"
+                # Continue to onboarding interpreter to extract the score
+                current_step = "neet_score"
+                # Fall through to onboarding interpreter below
+            elif intro_intent == "continue_onboarding":
+                # User expressed interest (looking for colleges, etc.) - brief intro + ask score
+                answer = (
+                    "Hi! I'm Anuj, your NEET counselling assistant. 👋\n\n"
+                    "I'd be happy to help you find colleges. Let me collect a few details first.\n\n"
+                    "What's your NEET score (e.g., 540 marks) or expected rank (e.g., AIR 15000)?"
+                )
+                preferences_json["intro"] = "confirmed"
+                current_step = "neet_score"
+                recent = append_recent_chats(
+                    recent_chats,
+                    user_text=question,
+                    assistant_text=answer,
+                )
+                save_user_chat_context(
+                    supabase_client,
+                    user_id=user_id,
+                    summary_text=context_row.get("summary_text", ""),
+                    recent_chats=recent,
+                    preferences_json=preferences_json,
+                )
+                return {
+                    "sql": None,
+                    "data": [],
+                    "answer": answer,
+                    "needs_clarification": True,
+                    "data_year": data_year,
+                    "onboarding_step": current_step,
+                    "onboarding_options": None,
+                }
+            else:
+                # Generic/unclear greeting - show full intro
+                answer = onboarding_status.next_question
+                recent = append_recent_chats(
+                    recent_chats,
+                    user_text=question,
+                    assistant_text=answer,
+                )
+                save_user_chat_context(
+                    supabase_client,
+                    user_id=user_id,
+                    summary_text=context_row.get("summary_text", ""),
+                    recent_chats=recent,
+                    preferences_json=preferences_json,
+                )
+                return {
+                    "sql": None,
+                    "data": [],
+                    "answer": answer,
+                    "needs_clarification": True,
+                    "data_year": data_year,
+                    "onboarding_step": current_step,
+                    "onboarding_options": onboarding_status.options,
+                }
         
         # Returning user with partial preferences but new session - show progress + next question
         if not already_started_onboarding and has_some_preferences:
@@ -752,10 +801,13 @@ def _handle_question(question: str, prior_messages: list[dict] | None = None) ->
     question_for_context = _resolve_own_state_phrase(question, user_home_state)
     
     # Build context with user preferences for intelligent query handling
+    # Use ISOLATED context to prevent data confusion between historical results and current query
     pref_context = format_preferences_for_context(preferences_json)
-    base_context = build_contextual_query(
+    base_context = build_isolated_context(
         question_for_context,
         recent_chats,
+        include_assistant_responses=True,  # Include for conversational context
+        max_user_history=6,  # Limit historical user messages
     )
     
     # Combine preferences with query context
@@ -818,15 +870,27 @@ def _handle_question(question: str, prior_messages: list[dict] | None = None) ->
     extracted = gate.extracted or {}
     extracted_home_state = str(extracted.get("home_state_for_query", "")).strip()
     extracted_target_state = str(extracted.get("target_state", "")).strip()
-    effective_home_state = extracted_home_state or user_home_state
-    norm_home = (resolve_state(effective_home_state) or (effective_home_state or "").strip().upper()) if effective_home_state else ""
-    norm_target = (resolve_state(extracted_target_state) or extracted_target_state.strip().upper()) if extracted_target_state else ""
+    
+    # CRITICAL: Only use profile home_state for SELF queries
+    # For FRIEND/GENERAL queries, only use extracted home_state (don't fall back to profile)
+    query_type = str(extracted.get("query_type", "unknown")).lower()
+    if query_type in ("friend", "general"):
+        # For friend/general queries, only use explicitly provided home_state
+        effective_home_state = extracted_home_state if extracted_home_state else ""
+        logger.info("[%s] Query type=%s: NOT using profile home_state, extracted=%s", 
+                    request_id, query_type, extracted_home_state or "(empty)")
+    else:
+        # For self/unknown queries, can fall back to profile
+        effective_home_state = extracted_home_state or user_home_state
+        
     use_profile_defaults_llm = bool(extracted.get("use_profile_defaults", False))
+    
+    # For friend/general queries, force use_profile_defaults to False
+    if query_type in ("friend", "general"):
+        use_profile_defaults_llm = False
+        logger.info("[%s] Query type=%s: Forcing use_profile_defaults=False", request_id, query_type)
+    
     explicit_college_types = _extract_college_types_from_text(question_for_context)
-    missing_slots = extracted.get("missing_slots", [])
-    if not isinstance(missing_slots, list):
-        missing_slots = []
-    missing_slots = [str(x).strip().lower() for x in missing_slots]
 
     if extracted.get("needs_confirmation") and extracted.get("confirmation_question"):
         clarification = str(extracted.get("confirmation_question")).strip()
@@ -851,61 +915,23 @@ def _handle_question(question: str, prior_messages: list[dict] | None = None) ->
             "data_year": data_year,
         }
 
-    # Policy: category needed only for home-state or MCC/AIQ searches.
-    if "category" in missing_slots:
-        is_home_state_query = bool(norm_home and norm_target and norm_home == norm_target)
-        is_mcc_query = _is_mcc_target(norm_target)
-        if not (is_home_state_query or is_mcc_query):
-            missing_slots = [s for s in missing_slots if s != "category"]
-            logger.info(
-                "[%s] Removed 'category' from missing slots by policy (home=%s target=%s)",
-                request_id,
-                norm_home,
-                norm_target,
-            )
+    # NOTE: We trust the LLM to ask for home_state when needed for friend/general queries.
+    # The prompt in query_validation.py has clear instructions for this.
+    # Backend only respects query_type to decide whether to use profile data (above).
 
-    if missing_slots:
-        slot_map = {
-            "state_or_mcc": "state or MCC",
-            "category": "category",
-            "college_type": "college type (government/private/deemed)",
-            "neet_metric": "NEET score (marks) or All India Rank",
-        }
-        human_missing = [slot_map.get(s, s) for s in missing_slots]
-        clarification = (
-            "Got it — before I run the search, please confirm "
-            + ", ".join(human_missing)
-            + "."
-        )
-        logger.info("[%s] LLM reported missing slots: %s", request_id, missing_slots)
-        recent = append_recent_chats(
-            recent_chats,
-            user_text=question,
-            assistant_text=clarification,
-        )
-        save_user_chat_context(
-            supabase_client,
-            user_id=user_id,
-            summary_text=context_row.get("summary_text", ""),
-            recent_chats=recent,
-            preferences_json=preferences_json,
-        )
-        return {
-            "sql": None,
-            "data": [],
-            "answer": clarification,
-            "needs_clarification": True,
-            "data_year": data_year,
-        }
+    # Trust the LLM's decision. If LLM said run_database_query, we run it.
+    # If data is missing, LLM should have returned ask_clarification instead.
+    # No hardcoded missing_slots overrides - that's the LLM's job.
 
-    # Use profile defaults only when LLM says so (or explicit profile mode).
+    # Profile data only applies to SELF queries (query_type determined by LLM)
     use_profile_defaults = use_profile_defaults_for_query or use_profile_defaults_llm
-    user_category = preferences_json.get("category") if use_profile_defaults else None
-    # Important: do NOT auto-apply stored college_type on normal queries.
-    # It should only come from the current message unless user explicitly
-    # asked to use full profile defaults.
-    raw_ct = preferences_json.get("college_type")
-    if use_profile_defaults:
+    if query_type in ("friend", "general"):
+        # LLM said this is not about the user - don't use profile
+        user_category = None
+        user_college_types = []
+    elif use_profile_defaults:
+        user_category = preferences_json.get("category")
+        raw_ct = preferences_json.get("college_type")
         if isinstance(raw_ct, list):
             user_college_types = [str(x).strip() for x in raw_ct if str(x).strip()]
         elif isinstance(raw_ct, str) and raw_ct.strip():
@@ -913,16 +939,12 @@ def _handle_question(question: str, prior_messages: list[dict] | None = None) ->
         else:
             user_college_types = []
     else:
+        user_category = None
         user_college_types = []
+    
+    # Explicit college types from current message override profile
     if explicit_college_types:
         user_college_types = explicit_college_types
-        logger.info(
-            "[%s] Explicit college type in current query overrides profile: %s",
-            request_id,
-            explicit_college_types,
-        )
-    elif not use_profile_defaults_for_query:
-        logger.info("[%s] No explicit college type in current query; skipping profile college_type default", request_id)
 
     sql_context = _build_sql_context(question_for_context, recent_chats)
     logger.info("[%s] SQL focused context:\n%s", request_id, _clip(sql_context))
