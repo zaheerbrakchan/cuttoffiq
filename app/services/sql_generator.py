@@ -92,6 +92,10 @@ The context contains conversation data. THREE types of queries:
    - PROFILE_SQL_HINTS will be provided → USE these values
    - Profile fills defaults for: home_state, category, score/rank, course
    - User's conversational overrides take priority
+   - If PROFILE_SQL_HINTS includes preferred college_type, SQL MUST include that exact college_type predicate.
+     * Example single type: college_type = 'GOVERNMENT'
+     * Example multiple: college_type IN ('GOVERNMENT', 'Private')
+   - NEVER broaden beyond requested/hinted college_type (do NOT include Private when asked for Government only).
 
 2. **FRIEND QUERY** (about someone else)
    - NO profile hints (profile doesn't apply to friends)
@@ -141,6 +145,10 @@ CRITICAL LOGIC RULES:
 4. OUTPUT:
    - ORDER BY air_rank ASC (for rank) or score DESC (for score)
    - Always LIMIT 50
+
+5. STRICT COLLEGE_TYPE RULE:
+   - When a strict college_type directive is present in the user prompt, treat it as mandatory.
+   - Include an exact college_type filter in WHERE and do not substitute or widen values.
 
 ---
 
@@ -970,7 +978,35 @@ def generate_sql(
         else:
             metric_directive = f"STRICT_SQL_RULE: This is eligibility query. Use ONLY air_rank >= {int(metric_value)}. Do not use BETWEEN."
 
-    parts = [p for p in (profile_hints.strip(), metric_directive.strip(), normalized.strip()) if p]
+    strict_college_type_directive = ""
+    strict_types = [
+        str(t).strip()
+        for t in (user_college_types or [])
+        if str(t).strip() and str(t).strip().upper() != "ALL"
+    ]
+    if strict_types:
+        if len(strict_types) == 1:
+            strict_college_type_directive = (
+                f"STRICT_SQL_RULE: Must include exact filter college_type = '{strict_types[0]}'. "
+                "Do not include any other college_type."
+            )
+        else:
+            allowed = ", ".join(f"'{t}'" for t in strict_types)
+            strict_college_type_directive = (
+                f"STRICT_SQL_RULE: Must include exact filter college_type IN ({allowed}). "
+                "Do not include college_type values outside this set."
+            )
+
+    parts = [
+        p
+        for p in (
+            profile_hints.strip(),
+            metric_directive.strip(),
+            strict_college_type_directive.strip(),
+            normalized.strip(),
+        )
+        if p
+    ]
     llm_user_message = "\n\n".join(parts)
     logger.info("[%s] SQL LLM system prompt:\n%s", rid, _clip(SQL_SYSTEM_PROMPT.strip()))
     logger.info("[%s] SQL LLM user prompt:\n%s", rid, _clip(llm_user_message))
